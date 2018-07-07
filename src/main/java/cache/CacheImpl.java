@@ -1,5 +1,6 @@
 package cache;
 
+import com.google.common.util.concurrent.Striped;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -15,6 +16,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.Lock;
 import java.util.stream.Collectors;
 
 import cache.strategy.CacheStrategyHandler;
@@ -41,6 +43,8 @@ public class CacheImpl<T extends Serializable> implements Cache<T> {
   protected final File levelTwoCacheDir;
 
   protected final Map<String, CacheEntry> map = new HashMap<>();
+
+  private final Striped<Lock> locks = Striped.lock(16);
 
   public CacheImpl(long levelOneSize, long levelTwoSize) {
     this(levelOneSize, levelTwoSize, Strategy.LFU, new File("cache2"));
@@ -83,66 +87,74 @@ public class CacheImpl<T extends Serializable> implements Cache<T> {
     Objects.requireNonNull(key, "The key cannot be NULL");
     Objects.requireNonNull(value, "The value cannot be NULL");
 
-    if (map.containsKey(key)) {
-      CacheEntry entry = map.get(key);
-      if (entry.onDisk) {
-        try {
-          entry.object = readFromTwoLevel(key);
-          if (!value.equals(entry.object)) {
-            entry = moveToMem(key, entry);
-            entry.object = value;
-          }
-        } catch (IOException e) {
-          levelTwoSize = 0;
-          entry.onDisk = false;
-          put(key, value);
-        }
-      } else if (!value.equals(entry.object)) {
-        entry.object = value;
-      }
-    } else if (levelOneSize > 0) {
-      String outKey = levelOneHandler.handle(key);
-      if (outKey != null) {
-        CacheEntry outEntry = map.get(outKey);
-        if (levelTwoSize <= 0) {
-          map.remove(outKey);
-        } else {
-          String lostKey = levelTwoHandler.handle(outKey);
-          if (lostKey != null) {
-            map.remove(lostKey);
-            removeFromTwoLevel(lostKey);
-          }
+    if (levelOneSize <= 0 && levelTwoSize <= 0) {
+      throw new IllegalStateException("cache.Cache is unavailable");
+    }
+
+    Lock lock = locks.get(key);
+    lock.lock();
+    try {
+      if (map.containsKey(key)) {
+        CacheEntry entry = map.get(key);
+        if (entry.onDisk) {
           try {
-            writeToTwoLevel(outKey, outEntry.object);
-            outEntry.object = null;
-            outEntry.onDisk = true;
+            entry.object = readFromTwoLevel(key);
+            if (!value.equals(entry.object)) {
+              entry = moveToMem(key, entry);
+              entry.object = value;
+            }
           } catch (IOException e) {
             levelTwoSize = 0;
-            outEntry.onDisk = false;
+            entry.onDisk = false;
             put(key, value);
           }
+        } else if (!value.equals(entry.object)) {
+          entry.object = value;
+        }
+      } else if (levelOneSize > 0) {
+        String outKey = levelOneHandler.handle(key);
+        if (outKey != null) {
+          CacheEntry outEntry = map.get(outKey);
+          if (levelTwoSize <= 0) {
+            map.remove(outKey);
+          } else {
+            String lostKey = levelTwoHandler.handle(outKey);
+            if (lostKey != null) {
+              map.remove(lostKey);
+              removeFromTwoLevel(lostKey);
+            }
+            try {
+              writeToTwoLevel(outKey, outEntry.object);
+              outEntry.object = null;
+              outEntry.onDisk = true;
+            } catch (IOException e) {
+              levelTwoSize = 0;
+              outEntry.onDisk = false;
+              put(key, value);
+            }
+          }
+        }
+        CacheEntry entry = new CacheEntry();
+        entry.object = value;
+        map.put(key, entry);
+      } else {
+        CacheEntry entry = new CacheEntry();
+        entry.onDisk = true;
+        map.put(key, entry);
+        String lostKey = levelTwoHandler.handle(key);
+        if (lostKey != null) {
+          map.remove(lostKey);
+          removeFromTwoLevel(lostKey);
+        }
+        try {
+          writeToTwoLevel(key, value);
+        } catch (IOException e) {
+          levelTwoSize = 0;
+          put(key, value);
         }
       }
-      CacheEntry entry = new CacheEntry();
-      entry.object = value;
-      map.put(key, entry);
-    } else if (levelTwoSize > 0) {
-      CacheEntry entry = new CacheEntry();
-      entry.onDisk = true;
-      map.put(key, entry);
-      String lostKey = levelTwoHandler.handle(key);
-      if (lostKey != null) {
-        map.remove(lostKey);
-        removeFromTwoLevel(lostKey);
-      }
-      try {
-        writeToTwoLevel(key, value);
-      } catch (IOException e) {
-        levelTwoSize = 0;
-        put(key, value);
-      }
-    } else {
-      throw new IllegalStateException("cache.Cache is unavailable");
+    } finally {
+      lock.unlock();
     }
   }
 
@@ -150,17 +162,27 @@ public class CacheImpl<T extends Serializable> implements Cache<T> {
   public T get(String key) {
     Objects.requireNonNull(key, "The key cannot be NULL");
 
-    CacheEntry entry = map.get(key);
+    CacheEntry entry;
+    Lock lock = locks.get(key);
+    lock.lock();
+    try {
+      entry = map.get(key);
+    } finally {
+      lock.unlock();
+    }
     if (entry == null) {
       return null;
     }
 
     if (entry.onDisk) {
+      lock.lock();
       try {
         return moveToMem(key, entry).object;
       } catch (IOException e) {
         levelTwoSize = 0;
         return null;
+      } finally {
+        lock.unlock();
       }
     } else {
       levelOneHandler.handle(key);
